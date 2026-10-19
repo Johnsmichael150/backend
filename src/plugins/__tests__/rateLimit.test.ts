@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import Fastify, { FastifyInstance, FastifyServerOptions, RouteOptions } from 'fastify';
 import jwt from 'jsonwebtoken';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { classifyRoute, registerRateLimiting, RateLimitingOptions } from '../rateLimit';
 
 // These tests exercise rate-limit bucketing, not database-backed JWT revocation.
@@ -14,12 +16,14 @@ import { requireAdmin } from '../../middleware/rbac';
 import { globalErrorHandler } from '../../middleware/error-handler';
 import { config } from '../../config/env';
 import {
+  MONITORING_PATHS,
   RATE_LIMIT_EXEMPTIONS,
   RATE_LIMIT_POLICIES,
   RATE_LIMIT_RULES,
   RateLimitClass,
   RateLimitPolicy,
   parseTrustProxy,
+  routeMatches,
 } from '../../config/rate-limit';
 
 // Small, distinct limits so each class is distinguishable in a test.
@@ -35,6 +39,10 @@ const token = (userId: string) =>
   jwt.sign({ userId, email: `${userId}@example.com`, role: 'user' }, config.JWT_SECRET);
 
 const bearer = (userId: string) => ({ authorization: `Bearer ${token(userId)}` });
+
+/** Builds a route descriptor for the classifier, without registering it. */
+const route = (method: string | string[], url: string, extra: Partial<RouteOptions> = {}) =>
+  ({ method, url, handler: async () => ({}), ...extra }) as RouteOptions;
 
 let app: FastifyInstance;
 
@@ -60,6 +68,33 @@ async function buildApp(
   instance.get('/other-public', ok);
   instance.get('/private', { preHandler: authMiddleware }, ok);
   instance.post('/auth/login', ok);
+
+  await instance.ready();
+  return instance;
+}
+
+/**
+ * Builds an app with the real central exemptions, so the monitoring
+ * endpoints are registered exactly as they are in production.
+ */
+async function buildMonitoringApp(): Promise<FastifyInstance> {
+  const instance = Fastify({ logger: false });
+  instance.setErrorHandler(globalErrorHandler);
+
+  await registerRateLimiting(instance, {
+    enabled: true,
+    store: 'memory',
+    policies: POLICIES,
+    rules: [{ method: 'POST', url: '/auth/login', class: 'sensitive' }],
+    exemptions: RATE_LIMIT_EXEMPTIONS,
+  });
+
+  const ok = async () => ({ ok: true });
+  instance.get(MONITORING_PATHS.health, ok);
+  instance.get(MONITORING_PATHS.readiness, ok);
+  instance.get(MONITORING_PATHS.metrics, ok);
+  instance.get(MONITORING_PATHS.metricsJson, ok);
+  instance.get('/public', ok);
 
   await instance.ready();
   return instance;
@@ -307,10 +342,152 @@ describe('client IP behind a reverse proxy', () => {
   });
 });
 
-describe('route classification', () => {
-  const route = (method: string | string[], url: string, extra: Partial<RouteOptions> = {}) =>
-    ({ method, url, handler: async () => ({}), ...extra }) as RouteOptions;
+describe('monitoring endpoints', () => {
+  const MONITORING_URLS = Object.values(MONITORING_PATHS);
 
+  it('classifies the monitoring endpoints as exempt in the central config', () => {
+    const classify = (r: RouteOptions) =>
+      classifyRoute(r, RATE_LIMIT_POLICIES, RATE_LIMIT_RULES, RATE_LIMIT_EXEMPTIONS);
+
+    for (const url of MONITORING_URLS) {
+      expect(classify(route('GET', url))).toBe('exempt');
+    }
+    // Fastify auto-registers HEAD for every GET; the probe must be exempt too.
+    expect(classify(route('HEAD', MONITORING_PATHS.metrics))).toBe('exempt');
+    expect(classify(route('HEAD', MONITORING_PATHS.metricsJson))).toBe('exempt');
+  });
+
+  it('never throttles monitoring traffic, however hard it is scraped', async () => {
+    app = await buildMonitoringApp();
+
+    for (const url of MONITORING_URLS) {
+      const responses = await hit(url, 100);
+
+      expect(responses.map((r) => r.statusCode)).toEqual(responses.map(() => 200));
+      // Skipped entirely: no counter, so no rate-limit headers at all.
+      for (const res of responses) {
+        expect(res.headers['x-ratelimit-limit']).toBeUndefined();
+        expect(res.headers['x-ratelimit-remaining']).toBeUndefined();
+      }
+    }
+  });
+
+  it('exempts monitoring traffic coming from any client IP', async () => {
+    app = await buildMonitoringApp();
+
+    // A load balancer or a Prometheus replica may reach the API from any
+    // address; none of them may be throttled by the probe.
+    for (const url of MONITORING_URLS) {
+      for (let i = 0; i < 10; i++) {
+        const res = await app.inject({
+          method: 'GET',
+          url,
+          remoteAddress: `10.0.${i}.7`,
+        });
+        expect(res.statusCode).toBe(200);
+      }
+
+      // The exemption is not per-IP: one address polling in a tight loop is
+      // exempt as well.
+      const repeated = await hit(url, 20, { remoteAddress: '203.0.113.1' });
+      expect(repeated.map((r) => r.statusCode)).toEqual(repeated.map(() => 200));
+    }
+  });
+
+  it('does not consume the rate limit quota of a user route', async () => {
+    app = await buildMonitoringApp();
+
+    // Monitoring traffic between user requests must not eat the user's quota.
+    await hit('/metrics', 50);
+    await hit('/health', 50);
+
+    const responses = await hit('/public', 3);
+    expect(responses.map((r) => r.statusCode)).toEqual([200, 200, 200]);
+    expect(responses[2].headers['x-ratelimit-remaining']).toBe('0');
+
+    const [blocked] = await hit('/public', 1);
+    expect(blocked.statusCode).toBe(429);
+  });
+
+  it('does not let monitoring traffic from one IP consume another client quota', async () => {
+    app = await buildMonitoringApp();
+
+    await app.inject({ method: 'GET', url: '/metrics', remoteAddress: '10.0.0.1' });
+
+    // A user behind another address still gets the full quota.
+    const responses = await hit('/public', 3, { remoteAddress: '203.0.113.9' });
+    expect(responses.map((r) => r.statusCode)).toEqual([200, 200, 200]);
+  });
+
+  it('keeps user routes limited while the monitoring endpoints stay available', async () => {
+    app = await buildMonitoringApp();
+
+    await hit('/public', 3);
+    const [blocked] = await hit('/public', 1);
+    expect(blocked.statusCode).toBe(429);
+
+    // The limiter rejects the user request, never the probe.
+    const [metrics] = await hit('/metrics', 1);
+    expect(metrics.statusCode).toBe(200);
+  });
+
+  it('exempts every monitoring path declared in the central config', () => {
+    // The exemption list is built from MONITORING_PATHS, so a path that is
+    // served but not exempted would silently fall back to the default class.
+    for (const probePath of Object.values(MONITORING_PATHS)) {
+      expect(
+        RATE_LIMIT_EXEMPTIONS.some((m) => routeMatches(m, 'GET', probePath)),
+        `${probePath} is not rate-limit exempt`
+      ).toBe(true);
+    }
+  });
+
+  it('exempts every path the deployment probes', () => {
+    // The probe paths are read from the deployment manifests, so the
+    // exemption list cannot drift away from what the platform actually
+    // calls: a 429 on a liveness probe restarts the pod, and a 429 on a
+    // scrape raises a false "backend unavailable" alert.
+    const infraDir = path.resolve(__dirname, '../../../infra');
+    const manifests = [
+      path.join(infraDir, 'kubernetes/rollout.yaml'),
+      path.join(infraDir, 'kubernetes/servicemonitor.yaml'),
+      path.join(infraDir, 'monitoring/prometheus.yml'),
+    ];
+
+    const probed = new Set<string>();
+    for (const manifest of manifests) {
+      const content = readFileSync(manifest, 'utf8');
+      for (const match of content.matchAll(/^\s*(?:path|metrics_path):\s*(\/\S+)\s*$/gm)) {
+        probed.add(match[1]);
+      }
+    }
+
+    // Guard against a manifest change that silently breaks the parsing.
+    expect(probed.size).toBeGreaterThan(0);
+
+    for (const probePath of probed) {
+      expect(
+        RATE_LIMIT_EXEMPTIONS.some((m) => routeMatches(m, 'GET', probePath)),
+        `${probePath} is probed by the deployment but is not rate-limit exempt`
+      ).toBe(true);
+    }
+  });
+
+  it('registers the health probe under the path that is exempt', async () => {
+    // The health route is registered with the same constant the exemption
+    // list is built from, so the served path and the exempt path cannot
+    // disagree. Fastify rejects a path that does not start with a slash.
+    const instance = Fastify({ logger: false });
+    instance.get(MONITORING_PATHS.health, async () => ({ ok: true }));
+    await instance.ready();
+
+    const res = await instance.inject({ method: 'GET', url: MONITORING_PATHS.health });
+    expect(res.statusCode).toBe(200);
+    expect(classifyRoute(route('GET', MONITORING_PATHS.health))).toBe('exempt');
+  });
+});
+
+describe('route classification', () => {
   it('classifies the real application routes from the central config', () => {
     const classify = (r: RouteOptions) =>
       classifyRoute(r, RATE_LIMIT_POLICIES, RATE_LIMIT_RULES, RATE_LIMIT_EXEMPTIONS);
