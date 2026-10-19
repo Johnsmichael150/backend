@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import Fastify, { FastifyInstance, FastifyServerOptions, RouteOptions } from 'fastify';
 import jwt from 'jsonwebtoken';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { classifyRoute, registerRateLimiting, RateLimitingOptions } from '../rateLimit';
 
@@ -43,6 +43,24 @@ const bearer = (userId: string) => ({ authorization: `Bearer ${token(userId)}` }
 /** Builds a route descriptor for the classifier, without registering it. */
 const route = (method: string | string[], url: string, extra: Partial<RouteOptions> = {}) =>
   ({ method, url, handler: async () => ({}), ...extra }) as RouteOptions;
+
+/** The `src` directory of this package. */
+const SRC_DIR = path.resolve(__dirname, '../..');
+
+/** Source files under `dir`, excluding tests. */
+function listSourceFiles(dir: string): string[] {
+  const files: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (entry.name === '__tests__') continue;
+      files.push(...listSourceFiles(full));
+    } else if (entry.name.endsWith('.ts') && !entry.name.endsWith('.test.ts')) {
+      files.push(full);
+    }
+  }
+  return files;
+}
 
 let app: FastifyInstance;
 
@@ -484,6 +502,43 @@ describe('monitoring endpoints', () => {
     const res = await instance.inject({ method: 'GET', url: MONITORING_PATHS.health });
     expect(res.statusCode).toBe(200);
     expect(classifyRoute(route('GET', MONITORING_PATHS.health))).toBe('exempt');
+  });
+
+  it('serves the health probe under the path that is exempt', () => {
+    // The route in src/index.ts and the exemption list must name the same
+    // path. Before this fix the route was registered as 'health', without a
+    // leading slash: Fastify throws ("The first character of a path should be
+    // `/` or `*`") while the route is registered, so the API never booted
+    // and the probe was never served at all.
+    const indexSource = readFileSync(path.resolve(SRC_DIR, 'index.ts'), 'utf8');
+
+    expect(indexSource).toContain('MONITORING_PATHS.health');
+    expect(indexSource).not.toMatch(/\bapp\.get\(\s*'health'/);
+  });
+
+  it('declares every monitoring path with a leading slash', () => {
+    for (const [name, probePath] of Object.entries(MONITORING_PATHS)) {
+      expect(probePath.startsWith('/'), `${name} must start with a slash`).toBe(true);
+    }
+  });
+
+  it('registers every route under a path that starts with a slash', () => {
+    // A path without a leading slash makes Fastify throw while the route is
+    // registered, so a single bad path stops the whole API from booting.
+    const offenders: string[] = [];
+
+    for (const file of listSourceFiles(SRC_DIR)) {
+      const content = readFileSync(file, 'utf8');
+      for (const match of content.matchAll(
+        /\bapp\.(get|post|put|patch|delete|head|options)\(\s*'([^']*)'/g
+      )) {
+        if (!match[2].startsWith('/')) {
+          offenders.push(`${path.relative(SRC_DIR, file)}: app.${match[1]}('${match[2]}')`);
+        }
+      }
+    }
+
+    expect(offenders).toEqual([]);
   });
 });
 
